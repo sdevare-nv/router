@@ -343,6 +343,16 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     /// Health check endpoint path
     pub endpoint: String,
+    /// Mark a worker failing when it has requests in flight but has completed
+    /// none for this long. `/health` only proves the HTTP server is up; an
+    /// engine whose inner loop has wedged keeps answering it while making no
+    /// forward progress. 0 disables the check.
+    #[serde(default = "default_stall_timeout_secs")]
+    pub stall_timeout_secs: u64,
+}
+
+fn default_stall_timeout_secs() -> u64 {
+    300
 }
 
 impl Default for HealthCheckConfig {
@@ -353,6 +363,7 @@ impl Default for HealthCheckConfig {
             timeout_secs: 5,
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
+            stall_timeout_secs: default_stall_timeout_secs(),
         }
     }
 }

@@ -3,7 +3,7 @@ use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use serde_json;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
@@ -13,6 +13,14 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("Failed to create worker HTTP client")
 });
+
+/// Wall-clock seconds since the Unix epoch, used for stall detection.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Core worker abstraction that represents a backend service
 #[async_trait]
@@ -31,6 +39,19 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Set the worker's health status
     fn set_healthy(&self, healthy: bool);
+
+    /// Number of requests this worker has completed. Unlike `processed_requests`,
+    /// which counts dispatches at selection time, this only advances when a
+    /// request actually finishes, so it measures forward progress.
+    fn completions(&self) -> usize;
+
+    /// Whether this worker has been judged to be draining far slower than its
+    /// peers. Set by the registry health checker, which is the only place with
+    /// fleet-wide context; consumed by `check_health_async`.
+    fn is_degraded(&self) -> bool;
+
+    /// Mark the worker as degraded relative to its peers.
+    fn set_degraded(&self, degraded: bool);
 
     /// Perform an async health check on the worker
     async fn check_health_async(&self) -> WorkerResult<()>;
@@ -253,6 +274,12 @@ pub struct HealthConfig {
     pub failure_threshold: u32,
     /// Number of consecutive successes before marking healthy
     pub success_threshold: u32,
+    /// Treat a worker as failing when it has requests in flight but has not
+    /// completed any of them for this long. `/health` only proves the HTTP
+    /// server is up; an engine whose inner loop has wedged keeps answering it
+    /// while making no forward progress, so liveness alone cannot detect the
+    /// stall. 0 disables the check.
+    pub stall_timeout_secs: u64,
 }
 
 impl Default for HealthConfig {
@@ -263,6 +290,10 @@ impl Default for HealthConfig {
             endpoint: "/health".to_string(),
             failure_threshold: 3,
             success_threshold: 2,
+            // Comfortably longer than any single generation: the condition is
+            // that *no* in-flight request completed in the window, which even a
+            // slow worker clears easily.
+            stall_timeout_secs: 300,
         }
     }
 }
@@ -291,6 +322,13 @@ pub struct BasicWorker {
     healthy: Arc<AtomicBool>,
     consecutive_failures: Arc<AtomicUsize>,
     consecutive_successes: Arc<AtomicUsize>,
+    /// Unix seconds of the last observed request completion, used to tell a
+    /// wedged worker apart from a merely busy one.
+    last_completion: Arc<AtomicU64>,
+    /// Monotonic count of finished requests, sampled by the health checker to
+    /// derive a per-worker completion rate.
+    completions: Arc<AtomicUsize>,
+    degraded: Arc<AtomicBool>,
     circuit_breaker: CircuitBreaker,
 }
 
@@ -305,6 +343,18 @@ impl fmt::Debug for BasicWorker {
 }
 
 impl BasicWorker {
+    /// True when the worker holds in-flight requests but none has completed
+    /// within `stall_timeout_secs`. Requires load > 0 so an idle worker is
+    /// never flagged, and keys on completions rather than latency so a worker
+    /// running long generations stays healthy as long as *something* finishes.
+    fn is_stalled(&self) -> bool {
+        let window = self.metadata.health_config.stall_timeout_secs;
+        if window == 0 || self.load() == 0 {
+            return false;
+        }
+        now_secs().saturating_sub(self.last_completion.load(Ordering::Relaxed)) > window
+    }
+
     pub fn new(url: String, worker_type: WorkerType) -> Self {
         Self::with_connection_mode(url, worker_type, ConnectionMode::Http)
     }
@@ -329,6 +379,9 @@ impl BasicWorker {
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
+            last_completion: Arc::new(AtomicU64::new(now_secs())),
+            completions: Arc::new(AtomicUsize::new(0)),
+            degraded: Arc::new(AtomicBool::new(false)),
             circuit_breaker: CircuitBreaker::new(),
         }
     }
@@ -396,6 +449,11 @@ impl Worker for BasicWorker {
     async fn check_health_async(&self) -> WorkerResult<()> {
         use std::time::Duration;
 
+        // A wedged engine keeps answering /health while completing nothing, so
+        // liveness is checked alongside forward progress rather than instead of it.
+        let stalled = self.is_stalled();
+        let degraded = self.is_degraded();
+
         let health_result = match &self.metadata.connection_mode {
             ConnectionMode::Http => {
                 // Perform HTTP health check
@@ -410,6 +468,8 @@ impl Worker for BasicWorker {
                 }
             }
         };
+
+        let health_result = health_result && !stalled && !degraded;
 
         if health_result {
             // Health check succeeded
@@ -437,9 +497,27 @@ impl Worker for BasicWorker {
                 self.consecutive_failures.store(0, Ordering::Release);
             }
 
+            let reason = if degraded {
+                format!(
+                    "Draining far slower than peer workers while holding {} requests \
+                     (consecutive failures: {})",
+                    self.load(),
+                    failures
+                )
+            } else if stalled {
+                format!(
+                    "No request completed in {}s while {} were in flight \
+                     (consecutive failures: {})",
+                    self.metadata.health_config.stall_timeout_secs,
+                    self.load(),
+                    failures
+                )
+            } else {
+                format!("Health check failed (consecutive failures: {})", failures)
+            };
             Err(WorkerError::HealthCheckFailed {
                 url: self.metadata.url.clone(),
-                reason: format!("Health check failed (consecutive failures: {})", failures),
+                reason,
             })
         }
     }
@@ -466,6 +544,8 @@ impl Worker for BasicWorker {
                 "Attempted to decrement load counter that is already at 0"
             );
         }
+        self.last_completion.store(now_secs(), Ordering::Relaxed);
+        self.completions.fetch_add(1, Ordering::Relaxed);
         RouterMetrics::set_worker_load(self.url(), self.load());
     }
 
@@ -475,6 +555,18 @@ impl Worker for BasicWorker {
     fn reset_load(&self) {
         self.load_counter.store(0, Ordering::Relaxed);
         RouterMetrics::set_worker_load(self.url(), 0);
+    }
+
+    fn completions(&self) -> usize {
+        self.completions.load(Ordering::Relaxed)
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    fn set_degraded(&self, degraded: bool) {
+        self.degraded.store(degraded, Ordering::Relaxed);
     }
 
     fn processed_requests(&self) -> usize {
@@ -576,6 +668,18 @@ impl Worker for DPAwareWorker {
 
     fn reset_load(&self) {
         self.base_worker.reset_load();
+    }
+
+    fn completions(&self) -> usize {
+        self.base_worker.completions()
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.base_worker.is_degraded()
+    }
+
+    fn set_degraded(&self, degraded: bool) {
+        self.base_worker.set_degraded(degraded);
     }
 
     fn processed_requests(&self) -> usize {
@@ -938,6 +1042,85 @@ mod tests {
     }
 
     #[test]
+    fn test_completions_counts_only_finished_requests() {
+        // processed_requests counts dispatches at selection time; completions must
+        // only advance when a request actually finishes, since that is what the
+        // health checker uses to measure forward progress.
+        let w = BasicWorker::new("http://counts:8000".to_string(), WorkerType::Regular);
+        w.increment_load();
+        w.increment_load();
+        assert_eq!(w.completions(), 0, "dispatch must not count as completion");
+        w.decrement_load();
+        assert_eq!(w.completions(), 1);
+        w.decrement_load();
+        assert_eq!(w.completions(), 2);
+    }
+
+    #[test]
+    fn test_degraded_flag_defaults_off_and_round_trips() {
+        let w = BasicWorker::new("http://deg:8000".to_string(), WorkerType::Regular);
+        assert!(!w.is_degraded(), "workers must start healthy");
+        w.set_degraded(true);
+        assert!(w.is_degraded());
+        w.set_degraded(false);
+        assert!(!w.is_degraded());
+    }
+
+    #[test]
+    fn test_stall_idle_worker_never_flagged() {
+        // load == 0 means nothing is outstanding, so there is nothing to stall on;
+        // an idle worker must stay healthy no matter how long it has been quiet.
+        let w = BasicWorker::new("http://idle:8000".to_string(), WorkerType::Regular);
+        w.last_completion.store(now_secs() - 10_000, Ordering::Relaxed);
+        assert_eq!(w.load(), 0);
+        assert!(!w.is_stalled());
+    }
+
+    #[test]
+    fn test_stall_recent_completion_not_flagged() {
+        let w = BasicWorker::new("http://busy:8000".to_string(), WorkerType::Regular);
+        w.increment_load();
+        w.last_completion.store(now_secs(), Ordering::Relaxed);
+        assert!(!w.is_stalled());
+    }
+
+    #[test]
+    fn test_stall_no_completions_flagged() {
+        // The failure this guards: requests in flight, none completing, /health
+        // still returning 200 because the HTTP server is alive.
+        let w = BasicWorker::new("http://wedged:8000".to_string(), WorkerType::Regular);
+        w.increment_load();
+        let window = w.metadata.health_config.stall_timeout_secs;
+        w.last_completion
+            .store(now_secs() - (window + 1), Ordering::Relaxed);
+        assert!(w.is_stalled());
+    }
+
+    #[test]
+    fn test_stall_disabled_by_zero_timeout() {
+        let mut w = BasicWorker::new("http://opt-out:8000".to_string(), WorkerType::Regular);
+        w.metadata.health_config.stall_timeout_secs = 0;
+        w.increment_load();
+        w.last_completion.store(now_secs() - 10_000, Ordering::Relaxed);
+        assert!(!w.is_stalled());
+    }
+
+    #[test]
+    fn test_stall_cleared_by_completion() {
+        // A worker that recovers on its own must be usable again without operator
+        // action; decrement_load is the completion signal.
+        let w = BasicWorker::new("http://recovers:8000".to_string(), WorkerType::Regular);
+        w.increment_load();
+        w.increment_load();
+        let window = w.metadata.health_config.stall_timeout_secs;
+        w.last_completion
+            .store(now_secs() - (window + 1), Ordering::Relaxed);
+        assert!(w.is_stalled());
+        w.decrement_load();
+        assert!(!w.is_stalled(), "a completed request should clear the stall");
+    }
+
+    #[test]
     fn test_worker_load_guard_drop_decrements() {
         let worker = test_worker();
         {
@@ -1080,6 +1263,7 @@ mod tests {
             endpoint: "/healthz".to_string(),
             failure_threshold: 5,
             success_threshold: 3,
+            ..Default::default()
         };
         assert_eq!(config.timeout_secs, 10);
         assert_eq!(config.check_interval_secs, 60);
@@ -1119,6 +1303,7 @@ mod tests {
             endpoint: "/custom-health".to_string(),
             failure_threshold: 4,
             success_threshold: 2,
+            ..Default::default()
         };
 
         let worker = BasicWorker::new("http://test:8080".to_string(), WorkerType::Regular)
@@ -1738,6 +1923,7 @@ mod tests {
             endpoint: "/health".to_string(),
             failure_threshold: 3,
             success_threshold: 1,
+            ..Default::default()
         };
 
         let dp_worker =

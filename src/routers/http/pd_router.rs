@@ -584,6 +584,7 @@ impl PdRouterBase {
             endpoint: ctx.router_config.health_check.endpoint.clone(),
             failure_threshold: ctx.router_config.health_check.failure_threshold,
             success_threshold: ctx.router_config.health_check.success_threshold,
+            stall_timeout_secs: ctx.router_config.health_check.stall_timeout_secs,
         };
 
         // Register prefill workers in the registry

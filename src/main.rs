@@ -340,6 +340,13 @@ struct CliArgs {
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
 
+    /// Mark a worker failing when it has requests in flight but has completed none
+    /// for this many seconds. The health endpoint only proves the HTTP server is
+    /// up; an engine whose inner loop has wedged keeps answering it while making
+    /// no forward progress. 0 disables the check.
+    #[arg(long, default_value_t = 300)]
+    health_stall_timeout_secs: u64,
+
     // IGW (Inference Gateway) configuration
     /// Enable Inference Gateway mode
     #[arg(long, default_value_t = false)]
@@ -590,6 +597,7 @@ impl CliArgs {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                stall_timeout_secs: self.health_stall_timeout_secs,
             },
             enable_igw: self.enable_igw,
             rate_limit_tokens_per_second: None,

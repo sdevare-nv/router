@@ -99,6 +99,7 @@ impl Router {
             endpoint: ctx.router_config.health_check.endpoint.clone(),
             failure_threshold: ctx.router_config.health_check.failure_threshold,
             success_threshold: ctx.router_config.health_check.success_threshold,
+            stall_timeout_secs: ctx.router_config.health_check.stall_timeout_secs,
         };
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
@@ -2122,6 +2123,7 @@ mod tests {
                 endpoint: "/health".to_string(),
                 failure_threshold: 3,
                 success_threshold: 1,
+                ..Default::default()
             }),
         );
         registry.register(healthy_worker);
@@ -2133,6 +2135,7 @@ mod tests {
                 endpoint: "/health".to_string(),
                 failure_threshold: 3,
                 success_threshold: 1,
+                ..Default::default()
             }),
         );
         delayed_worker.set_healthy(false); // starts unhealthy

@@ -91,6 +91,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
+    health_stall_timeout_secs: int = 300
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3
@@ -463,6 +464,17 @@ class RouterArgs:
             type=str,
             default=RouterArgs.health_check_endpoint,
             help="Health check endpoint path",
+        )
+        parser.add_argument(
+            f"--{prefix}health-stall-timeout-secs",
+            type=int,
+            default=RouterArgs.health_stall_timeout_secs,
+            help=(
+                "Mark a worker failing when it has requests in flight but has "
+                "completed none for this many seconds. The health endpoint only "
+                "proves the HTTP server is up; a wedged engine keeps answering it "
+                "while making no forward progress. 0 disables the check."
+            ),
         )
         parser.add_argument(
             f"--{prefix}max-concurrent-requests",

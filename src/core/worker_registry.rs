@@ -59,6 +59,21 @@ pub struct WorkerRegistry {
     url_to_id: Arc<DashMap<String, WorkerId>>,
 }
 
+/// A worker is flagged as degraded when its completion rate over a health-check
+/// interval is worse than the best same-type peer by more than this factor. Set
+/// deliberately high: the intent is to catch a worker that has effectively stopped
+/// serving (observed in practice at 20-50x), not to micro-balance normal variation.
+const DEGRADED_RATIO: f64 = 10.0;
+
+/// The best peer must have completed at least this many requests in the interval
+/// before the comparison means anything. Guards the start of a run and quiet
+/// periods, where small counts make ratios meaningless.
+const DEGRADED_MIN_PEER_COMPLETIONS: usize = 10;
+
+/// Consecutive intervals a worker must look degraded before it is acted on, so a
+/// single unlucky interval cannot evict a healthy worker.
+const DEGRADED_CONSECUTIVE_TICKS: u32 = 3;
+
 impl WorkerRegistry {
     /// Create a new worker registry
     pub fn new() -> Self {
@@ -364,6 +379,14 @@ impl WorkerRegistry {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
 
+            // Completion counts sampled on the previous tick, per worker URL, plus how
+            // many consecutive ticks that worker has looked degraded. A worker is only
+            // acted on after several ticks so a single slow interval cannot evict it.
+            let mut last_completions: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let mut degraded_ticks: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+
             loop {
                 interval.tick().await;
 
@@ -378,6 +401,64 @@ impl WorkerRegistry {
                     .iter()
                     .map(|entry| entry.value().clone())
                     .collect();
+
+                // Flag workers that are draining far slower than their peers.
+                //
+                // In-flight request count is the load signal the policies use, but it
+                // inverts when a worker degrades: a worker that has stopped draining
+                // stops being handed new work by the client, so its queue can be
+                // *shorter* than a healthy peer's while it serves at a fraction of the
+                // rate. Comparing completion rate against the best peer of the same
+                // type catches that, and is self-normalising -- if every worker is
+                // slow, the ratio stays near 1 and nothing is flagged.
+                {
+                    let mut deltas: Vec<(usize, String, crate::core::WorkerType, usize)> =
+                        Vec::with_capacity(workers.len());
+                    for (i, w) in workers.iter().enumerate() {
+                        let total = w.completions();
+                        let prev = last_completions.insert(w.url().to_string(), total);
+                        let delta = total.saturating_sub(prev.unwrap_or(total));
+                        deltas.push((i, w.url().to_string(), w.worker_type(), delta));
+                    }
+                    for (i, url, wtype, delta) in &deltas {
+                        let best = deltas
+                            .iter()
+                            .filter(|(_, _, t, _)| t == wtype)
+                            .map(|(_, _, _, d)| *d)
+                            .max()
+                            .unwrap_or(0);
+                        let w = &workers[*i];
+                        // Only meaningful once some peer is making real progress and
+                        // this worker is actually holding requests.
+                        let looks_degraded = DEGRADED_RATIO > 0.0
+                            && w.load() > 0
+                            && best >= DEGRADED_MIN_PEER_COMPLETIONS
+                            && ((*delta as f64) * DEGRADED_RATIO) < (best as f64);
+                        let ticks = degraded_ticks.entry(url.clone()).or_insert(0);
+                        if looks_degraded {
+                            *ticks += 1;
+                        } else {
+                            *ticks = 0;
+                            if w.is_degraded() {
+                                tracing::info!(
+                                    worker_url = %url,
+                                    "Worker recovered peer-relative throughput; clearing degraded flag"
+                                );
+                                w.set_degraded(false);
+                            }
+                        }
+                        if *ticks >= DEGRADED_CONSECUTIVE_TICKS && !w.is_degraded() {
+                            tracing::warn!(
+                                worker_url = %url,
+                                completions_this_tick = *delta,
+                                best_peer_completions = best,
+                                in_flight = w.load(),
+                                "Worker draining far slower than peers; marking degraded"
+                            );
+                            w.set_degraded(true);
+                        }
+                    }
+                }
 
                 // Perform health checks in parallel. Health checking must not
                 // mutate load accounting: a failed /health probe does not
@@ -457,6 +538,18 @@ mod tests {
 
         fn set_healthy(&self, healthy: bool) {
             self.0.set_healthy(healthy);
+        }
+
+        fn completions(&self) -> usize {
+            self.0.completions()
+        }
+
+        fn is_degraded(&self) -> bool {
+            self.0.is_degraded()
+        }
+
+        fn set_degraded(&self, degraded: bool) {
+            self.0.set_degraded(degraded);
         }
 
         async fn check_health_async(&self) -> WorkerResult<()> {
@@ -616,6 +709,7 @@ mod tests {
                     endpoint: "/health".to_string(),
                     failure_threshold: 3,
                     success_threshold: 1,
+                    ..Default::default()
                 },
             ),
         )
