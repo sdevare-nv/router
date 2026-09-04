@@ -428,6 +428,10 @@ impl WorkerRegistry {
                             .max()
                             .unwrap_or(0);
                         let w = &workers[*i];
+                        // Stall detection is only meaningful while a peer is still
+                        // completing work; a quiet fleet (the straggler tail of a run)
+                        // must not look like a stuck worker.
+                        w.set_peer_progressing(best >= DEGRADED_MIN_PEER_COMPLETIONS);
                         // Only meaningful once some peer is making real progress and
                         // this worker is actually holding requests.
                         let looks_degraded = DEGRADED_RATIO > 0.0
@@ -550,6 +554,10 @@ mod tests {
 
         fn set_degraded(&self, degraded: bool) {
             self.0.set_degraded(degraded);
+        }
+
+        fn set_peer_progressing(&self, progressing: bool) {
+            self.0.set_peer_progressing(progressing);
         }
 
         async fn check_health_async(&self) -> WorkerResult<()> {

@@ -344,7 +344,7 @@ struct CliArgs {
     /// for this many seconds. The health endpoint only proves the HTTP server is
     /// up; an engine whose inner loop has wedged keeps answering it while making
     /// no forward progress. 0 disables the check.
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 1800)]
     health_stall_timeout_secs: u64,
 
     // IGW (Inference Gateway) configuration

@@ -91,7 +91,7 @@ class RouterArgs:
     health_check_timeout_secs: int = 5
     health_check_interval_secs: int = 60
     health_check_endpoint: str = "/health"
-    health_stall_timeout_secs: int = 300
+    health_stall_timeout_secs: int = 1800
     # Circuit breaker configuration
     cb_failure_threshold: int = 10
     cb_success_threshold: int = 3

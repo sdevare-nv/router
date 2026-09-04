@@ -352,7 +352,10 @@ pub struct HealthCheckConfig {
 }
 
 fn default_stall_timeout_secs() -> u64 {
-    300
+    // A healthy worker was measured going 750s without completing anything while
+    // holding one long request at the tail of a run; an actual wedge ran 3660s.
+    // Sits well clear of the first without approaching the second.
+    1800
 }
 
 impl Default for HealthCheckConfig {

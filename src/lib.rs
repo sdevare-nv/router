@@ -337,7 +337,7 @@ impl Router {
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
-        health_stall_timeout_secs = 300,
+        health_stall_timeout_secs = 1800,
         // IGW defaults
         enable_igw = false,
         queue_size = 100,

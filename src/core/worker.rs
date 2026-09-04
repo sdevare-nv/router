@@ -53,6 +53,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Mark the worker as degraded relative to its peers.
     fn set_degraded(&self, degraded: bool);
 
+    /// Whether a same-type peer completed work recently. Set by the registry
+    /// health checker; gates stall detection so that a quiet fleet (e.g. the
+    /// straggler tail of a run, where nothing is completing anywhere) is not
+    /// mistaken for a stuck worker.
+    fn set_peer_progressing(&self, progressing: bool);
+
     /// Perform an async health check on the worker
     async fn check_health_async(&self) -> WorkerResult<()>;
 
@@ -290,10 +296,8 @@ impl Default for HealthConfig {
             endpoint: "/health".to_string(),
             failure_threshold: 3,
             success_threshold: 2,
-            // Comfortably longer than any single generation: the condition is
-            // that *no* in-flight request completed in the window, which even a
-            // slow worker clears easily.
-            stall_timeout_secs: 300,
+            // See config::types::default_stall_timeout_secs.
+            stall_timeout_secs: 1800,
         }
     }
 }
@@ -329,6 +333,7 @@ pub struct BasicWorker {
     /// derive a per-worker completion rate.
     completions: Arc<AtomicUsize>,
     degraded: Arc<AtomicBool>,
+    peer_progressing: Arc<AtomicBool>,
     circuit_breaker: CircuitBreaker,
 }
 
@@ -344,12 +349,19 @@ impl fmt::Debug for BasicWorker {
 
 impl BasicWorker {
     /// True when the worker holds in-flight requests but none has completed
-    /// within `stall_timeout_secs`. Requires load > 0 so an idle worker is
-    /// never flagged, and keys on completions rather than latency so a worker
-    /// running long generations stays healthy as long as *something* finishes.
+    /// within `stall_timeout_secs`, *while a same-type peer is still completing
+    /// work*.
+    ///
+    /// Three guards, each for a distinct false positive:
+    /// - `load() == 0`: an idle worker has nothing to stall on.
+    /// - `peer_progressing`: a quiet fleet is not a fault. At the tail of a run a
+    ///   healthy worker can hold one long request for many minutes while nothing
+    ///   completes anywhere; measured at 750s on a run that finished normally.
+    /// - keyed on completions, not latency: a worker running long generations is
+    ///   healthy as long as *something* finishes.
     fn is_stalled(&self) -> bool {
         let window = self.metadata.health_config.stall_timeout_secs;
-        if window == 0 || self.load() == 0 {
+        if window == 0 || self.load() == 0 || !self.peer_progressing.load(Ordering::Relaxed) {
             return false;
         }
         now_secs().saturating_sub(self.last_completion.load(Ordering::Relaxed)) > window
@@ -382,6 +394,7 @@ impl BasicWorker {
             last_completion: Arc::new(AtomicU64::new(now_secs())),
             completions: Arc::new(AtomicUsize::new(0)),
             degraded: Arc::new(AtomicBool::new(false)),
+            peer_progressing: Arc::new(AtomicBool::new(true)),
             circuit_breaker: CircuitBreaker::new(),
         }
     }
@@ -569,6 +582,10 @@ impl Worker for BasicWorker {
         self.degraded.store(degraded, Ordering::Relaxed);
     }
 
+    fn set_peer_progressing(&self, progressing: bool) {
+        self.peer_progressing.store(progressing, Ordering::Relaxed);
+    }
+
     fn processed_requests(&self) -> usize {
         self.processed_counter.load(Ordering::Relaxed)
     }
@@ -680,6 +697,10 @@ impl Worker for DPAwareWorker {
 
     fn set_degraded(&self, degraded: bool) {
         self.base_worker.set_degraded(degraded);
+    }
+
+    fn set_peer_progressing(&self, progressing: bool) {
+        self.base_worker.set_peer_progressing(progressing);
     }
 
     fn processed_requests(&self) -> usize {
@@ -1064,6 +1085,26 @@ mod tests {
         assert!(w.is_degraded());
         w.set_degraded(false);
         assert!(!w.is_degraded());
+    }
+
+    #[test]
+    fn test_stall_not_flagged_when_no_peer_is_progressing() {
+        // Regression: at the straggler tail of a run a healthy worker can hold one
+        // long request while nothing completes anywhere. Measured at 750s on a run
+        // that finished 1500/1500 normally -- the old unguarded check would have
+        // evicted that worker.
+        let w = BasicWorker::new("http://tail:8000".to_string(), WorkerType::Regular);
+        w.increment_load();
+        let window = w.metadata.health_config.stall_timeout_secs;
+        w.last_completion
+            .store(now_secs() - (window + 1), Ordering::Relaxed);
+        w.set_peer_progressing(false);
+        assert!(
+            !w.is_stalled(),
+            "a quiet fleet must not be mistaken for a stuck worker"
+        );
+        w.set_peer_progressing(true);
+        assert!(w.is_stalled(), "with a peer making progress it is a real stall");
     }
 
     #[test]
