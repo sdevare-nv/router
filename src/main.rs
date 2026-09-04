@@ -151,6 +151,24 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.5)]
     balance_rel_threshold: f32,
 
+    /// Override --balance-abs-threshold for prefill workers only.
+    /// Prefill and decode run at very different in-flight depths (prefill worker
+    /// load includes queued requests), so one pair of thresholds rarely suits both.
+    #[arg(long)]
+    prefill_balance_abs_threshold: Option<usize>,
+
+    /// Override --balance-rel-threshold for prefill workers only
+    #[arg(long)]
+    prefill_balance_rel_threshold: Option<f32>,
+
+    /// Override --balance-abs-threshold for decode workers only
+    #[arg(long)]
+    decode_balance_abs_threshold: Option<usize>,
+
+    /// Override --balance-rel-threshold for decode workers only
+    #[arg(long)]
+    decode_balance_rel_threshold: Option<f32>,
+
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120)]
     eviction_interval: u64,
@@ -356,13 +374,22 @@ impl CliArgs {
 
     /// Convert policy string to PolicyConfig
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
+        self.parse_policy_with(
+            policy_str,
+            self.balance_abs_threshold,
+            self.balance_rel_threshold,
+        )
+    }
+
+    /// Convert policy string to PolicyConfig with role-specific balance thresholds
+    fn parse_policy_with(&self, policy_str: &str, abs: usize, rel: f32) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
-                balance_abs_threshold: self.balance_abs_threshold,
-                balance_rel_threshold: self.balance_rel_threshold,
+                balance_abs_threshold: abs,
+                balance_rel_threshold: rel,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
             },
@@ -443,8 +470,24 @@ impl CliArgs {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: prefill_urls.clone(),
                 decode_urls: final_decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                prefill_policy: self.prefill_policy.as_ref().map(|p| {
+                    self.parse_policy_with(
+                        p,
+                        self.prefill_balance_abs_threshold
+                            .unwrap_or(self.balance_abs_threshold),
+                        self.prefill_balance_rel_threshold
+                            .unwrap_or(self.balance_rel_threshold),
+                    )
+                }),
+                decode_policy: self.decode_policy.as_ref().map(|p| {
+                    self.parse_policy_with(
+                        p,
+                        self.decode_balance_abs_threshold
+                            .unwrap_or(self.balance_abs_threshold),
+                        self.decode_balance_rel_threshold
+                            .unwrap_or(self.balance_rel_threshold),
+                    )
+                }),
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {

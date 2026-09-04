@@ -38,8 +38,15 @@ struct Router {
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
+    // Per-role overrides. Prefill and decode operate at very different in-flight
+    // depths (prefill load counters include queued requests), so one pair of
+    // thresholds cannot suit both. None falls back to the global value.
     balance_abs_threshold: usize,
     balance_rel_threshold: f32,
+    prefill_balance_abs_threshold: Option<usize>,
+    prefill_balance_rel_threshold: Option<f32>,
+    decode_balance_abs_threshold: Option<usize>,
+    decode_balance_rel_threshold: Option<f32>,
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
@@ -107,24 +114,32 @@ impl Router {
         };
 
         // Convert policy helper function
-        let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
-            match policy {
-                PolicyType::Random => ConfigPolicyConfig::Random,
-                PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
-                PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
-                    cache_threshold: self.cache_threshold,
-                    balance_abs_threshold: self.balance_abs_threshold,
-                    balance_rel_threshold: self.balance_rel_threshold,
-                    eviction_interval_secs: self.eviction_interval_secs,
-                    max_tree_size: self.max_tree_size,
-                },
-                PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5, // Default value
-                },
-                PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
-                    virtual_nodes: 160, // Default value
-                },
-            }
+        let convert_policy_with =
+            |policy: &PolicyType, abs: usize, rel: f32| -> ConfigPolicyConfig {
+                match policy {
+                    PolicyType::Random => ConfigPolicyConfig::Random,
+                    PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+                    PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
+                        cache_threshold: self.cache_threshold,
+                        balance_abs_threshold: abs,
+                        balance_rel_threshold: rel,
+                        eviction_interval_secs: self.eviction_interval_secs,
+                        max_tree_size: self.max_tree_size,
+                    },
+                    PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
+                        load_check_interval_secs: 5, // Default value
+                    },
+                    PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
+                        virtual_nodes: 160, // Default value
+                    },
+                }
+            };
+        let convert_policy = |policy: &PolicyType| {
+            convert_policy_with(
+                policy,
+                self.balance_abs_threshold,
+                self.balance_rel_threshold,
+            )
         };
 
         // Determine routing mode
@@ -137,8 +152,24 @@ impl Router {
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
-                decode_policy: self.decode_policy.as_ref().map(convert_policy),
+                prefill_policy: self.prefill_policy.as_ref().map(|p| {
+                    convert_policy_with(
+                        p,
+                        self.prefill_balance_abs_threshold
+                            .unwrap_or(self.balance_abs_threshold),
+                        self.prefill_balance_rel_threshold
+                            .unwrap_or(self.balance_rel_threshold),
+                    )
+                }),
+                decode_policy: self.decode_policy.as_ref().map(|p| {
+                    convert_policy_with(
+                        p,
+                        self.decode_balance_abs_threshold
+                            .unwrap_or(self.balance_abs_threshold),
+                        self.decode_balance_rel_threshold
+                            .unwrap_or(self.balance_rel_threshold),
+                    )
+                }),
                 discovery_address: self.vllm_discovery_address.clone(),
             }
         } else {
@@ -254,6 +285,10 @@ impl Router {
         cache_threshold = 0.3,
         balance_abs_threshold = 64,
         balance_rel_threshold = 1.5,
+        prefill_balance_abs_threshold = None,
+        prefill_balance_rel_threshold = None,
+        decode_balance_abs_threshold = None,
+        decode_balance_rel_threshold = None,
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
         max_payload_size = 512 * 1024 * 1024,  // 512MB default for large batches
@@ -322,6 +357,10 @@ impl Router {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
+        prefill_balance_abs_threshold: Option<usize>,
+        prefill_balance_rel_threshold: Option<f32>,
+        decode_balance_abs_threshold: Option<usize>,
+        decode_balance_rel_threshold: Option<f32>,
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_payload_size: usize,
@@ -383,6 +422,10 @@ impl Router {
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
+            prefill_balance_abs_threshold,
+            prefill_balance_rel_threshold,
+            decode_balance_abs_threshold,
+            decode_balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,

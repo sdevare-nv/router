@@ -30,6 +30,14 @@ class RouterArgs:
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
     balance_rel_threshold: float = 1.5
+    # Per-role overrides for the cache-aware balance thresholds. Prefill and decode
+    # run at very different in-flight depths -- prefill worker load includes queued
+    # requests -- so one pair of thresholds cannot suit both. None means "use the
+    # global value".
+    prefill_balance_abs_threshold: Optional[int] = None
+    prefill_balance_rel_threshold: Optional[float] = None
+    decode_balance_abs_threshold: Optional[int] = None
+    decode_balance_rel_threshold: Optional[float] = None
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -226,6 +234,21 @@ class RouterArgs:
             default=RouterArgs.balance_rel_threshold,
             help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
         )
+        for role in ("prefill", "decode"):
+            parser.add_argument(
+                f"--{prefix}{role}-balance-abs-threshold",
+                type=int,
+                default=None,
+                help=f"Override --{prefix}balance-abs-threshold for {role} workers only. "
+                f"Defaults to the global value.",
+            )
+            parser.add_argument(
+                f"--{prefix}{role}-balance-rel-threshold",
+                type=float,
+                default=None,
+                help=f"Override --{prefix}balance-rel-threshold for {role} workers only. "
+                f"Defaults to the global value.",
+            )
         parser.add_argument(
             f"--{prefix}eviction-interval-secs",
             type=int,
